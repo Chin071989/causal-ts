@@ -29,6 +29,8 @@ def temporal_bootstrap(
     window_frac: float = 0.6,
     seed: int = 42,
     show_progress: bool = True,
+    n_jobs: int = 1,
+    backend: str = "loky",
 ) -> dict:
     """Contiguous-window temporal bootstrap for causal discovery.
 
@@ -75,6 +77,19 @@ def temporal_bootstrap(
         closure for full reproducibility of GRACE runs.
     show_progress : bool, default True
         Show a tqdm progress bar.
+    n_jobs : int, default 1
+        Number of windows to run concurrently (joblib semantics: ``-1``
+        uses all cores).  All window starts are drawn from the ``seed`` RNG
+        up front, and outputs are collected in window order, so the result
+        is identical to the serial run (given a deterministic
+        ``discovery_fn``).  With the default ``"loky"`` backend
+        ``discovery_fn`` runs in worker processes and must be picklable
+        (closures are fine; loky uses cloudpickle).
+    backend : str, default "loky"
+        joblib backend used when ``n_jobs != 1``.  **GPU CI tests**
+        (``ParCorrGPU``, ``KCIGPU``, ...) should use ``n_jobs=1`` or
+        ``backend="threading"``: separate loky processes each initialise
+        their own CUDA context and compete for device memory.
 
     Returns
     -------
@@ -136,6 +151,11 @@ def temporal_bootstrap(
         raise ValueError(f"window_size {W} >= T {T}. Use window_frac < 1.0.")
 
     rng = np.random.default_rng(seed)
+    starts = [int(rng.integers(0, T - W + 1)) for _ in range(n_bootstrap)]
+    windows = (
+        (i, df.iloc[start : start + W].reset_index(drop=True))
+        for i, start in enumerate(starts)
+    )
 
     try:
         from tqdm.auto import tqdm as _tqdm
@@ -144,21 +164,26 @@ def temporal_bootstrap(
     except ImportError:
         _has_tqdm = False
 
+    if n_jobs == 1:
+        outcomes = (_run_window(discovery_fn, i, window) for i, window in windows)
+    else:
+        from joblib import Parallel, delayed
+
+        outcomes = Parallel(n_jobs=n_jobs, backend=backend, return_as="generator")(
+            delayed(_run_window)(discovery_fn, i, window) for i, window in windows
+        )
+    if show_progress and _has_tqdm:
+        outcomes = _tqdm(
+            outcomes, total=n_bootstrap, desc="temporal_bootstrap", unit="run"
+        )
+
     graphs: list[np.ndarray] = []
     errors: list[tuple[int, str]] = []
-
-    iterator = range(n_bootstrap)
-    if show_progress and _has_tqdm:
-        iterator = _tqdm(iterator, desc="temporal_bootstrap", unit="run")
-
-    for i in iterator:
-        start = int(rng.integers(0, T - W + 1))
-        window = df.iloc[start : start + W].reset_index(drop=True)
-        try:
-            result = discovery_fn(window)
-            graphs.append(np.asarray(result))
-        except Exception:
-            errors.append((i, traceback.format_exc()))
+    for i, ok, payload in outcomes:
+        if ok:
+            graphs.append(payload)
+        else:
+            errors.append((i, payload))
 
     if not graphs:
         raise RuntimeError(
@@ -176,3 +201,11 @@ def temporal_bootstrap(
         "window_size": W,
         "errors": errors,
     }
+
+
+def _run_window(discovery_fn, i, window):
+    """Run one bootstrap window; returns ``(i, ok, graph_or_traceback)``."""
+    try:
+        return i, True, np.asarray(discovery_fn(window))
+    except Exception:
+        return i, False, traceback.format_exc()

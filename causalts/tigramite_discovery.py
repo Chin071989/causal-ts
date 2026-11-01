@@ -12,6 +12,8 @@ Requires tigramite: pip install tigramite
 
 from __future__ import annotations
 
+import hashlib
+
 import numpy as np
 import pandas as pd
 
@@ -52,11 +54,19 @@ class CITestAdapter:
 
     The adapter is created automatically when a CIT_Base instance is passed
     to run_pcmciplus/run_pcmci/run_tigramite.
+
+    ``run_test`` results are memoised in ``_result_cache``, keyed on the
+    content of the constructed test array, so a CI test that PCMCI/PCMCI+
+    repeats (e.g. across the skeleton, MCI and orientation phases) runs the
+    GPU test only once. Cache hits increment ``n_tests`` but not
+    ``n_actual_tests``. The cache is cleared whenever new data is attached
+    (``set_dataframe`` or assigning ``dataframe``) and by ``clear_cache()``.
     """
 
     def __init__(self, gpu_test, significance="analytic", verbosity=0):
         self._gpu_test = gpu_test
         self._cached_pval = None
+        self._result_cache = {}
         self.significance = significance
         self.verbosity = verbosity
         self.pvalue_cache = {}
@@ -75,8 +85,26 @@ class CITestAdapter:
     def measure(self):
         return self._measure
 
+    @property
+    def dataframe(self):
+        return self._dataframe
+
+    @dataframe.setter
+    def dataframe(self, dataframe):
+        # Cached results are keyed on test arrays built from the old data.
+        self._dataframe = dataframe
+        self.clear_cache()
+
+    def clear_cache(self):
+        """Drop all memoised ``run_test`` results."""
+        self._result_cache = {}
+
     def set_dataframe(self, dataframe):
-        """Called by tigramite's PCMCI to provide data."""
+        """Called by tigramite's PCMCI to provide data.
+
+        ``PCMCIBase.__init__`` deep-copies the CI test and then calls this
+        method, so every PCMCI instance starts with an empty result cache.
+        """
         self.dataframe = dataframe
         data = self._extract_data(dataframe)
         if data is not None:
@@ -210,14 +238,20 @@ class CITestAdapter:
         )
 
         self.n_tests += 1
-        self.n_actual_tests += 1
-
-        # Check for zero-variance
-        if array.shape[1] == 0:
-            val, pval = 0.0, 1.0
+        key = self._get_array_hash(array, xyz, XYZ)
+        cached = self._result_cache.get(key)
+        if cached is not None:
+            val, pval = cached
+            self._cached_pval = pval
         else:
-            val = self.get_dependence_measure(array, xyz)
-            pval = self._cached_pval
+            self.n_actual_tests += 1
+            # Check for zero-variance
+            if array.shape[1] == 0:
+                val, pval = 0.0, 1.0
+            else:
+                val = self.get_dependence_measure(array, xyz)
+                pval = self._cached_pval
+            self._result_cache[key] = (val, pval)
 
         if alpha_or_thres is None:
             return val, pval
@@ -247,8 +281,15 @@ class CITestAdapter:
         return 0.0
 
     def _get_array_hash(self, array, xyz, XYZ):
-        """Hash for caching."""
-        return hash((array.tobytes(), xyz.tobytes()))
+        """Cache key for ``run_test``: digest of the exact test inputs.
+
+        Row order is kept as-is (no X/Y swapping or Z sorting), so a cache hit
+        returns exactly what the GPU test would compute for this array.
+        """
+        array = np.ascontiguousarray(array)
+        h = hashlib.sha1(array)
+        h.update(np.ascontiguousarray(xyz).tobytes())
+        return (array.shape, array.dtype.str, h.hexdigest())
 
     def save_incremental_cache(self, key, param_hash, pval, val):
         pass
@@ -383,36 +424,29 @@ def tigramite_graph_to_binary(
     if conflict not in ("drop", "bidirected"):
         raise ValueError(f"conflict must be 'drop' or 'bidirected', got {conflict!r}")
 
-    symmetric = set()
+    symmetric = []
     if undirected == "bidirected":
-        symmetric.add("o-o")
+        symmetric.append("o-o")
     if conflict == "bidirected":
-        symmetric.add("x-x")
+        symmetric.append("x-x")
 
-    d = tig_graph.shape[0]
-    tau_max_plus_1 = tig_graph.shape[2]
-    G = np.zeros((d, d, tau_max_plus_1), dtype=np.int8)
+    marks = np.char.strip(np.asarray(tig_graph).astype(str))
+    forward = np.isin(marks, ("-->", "o->"))
+    reverse = np.isin(marks, ("<--", "<-o"))
+    sym = np.isin(marks, symmetric)
 
-    for i in range(d):
-        for j in range(d):
-            for tau in range(tau_max_plus_1):
-                s = str(tig_graph[i, j, tau]).strip()
-                if s in ("-->", "o->"):
-                    if p_matrix is not None and alpha_level is not None:
-                        if p_matrix[i, j, tau] >= alpha_level:
-                            continue
-                    G[i, j, tau] = 1
-                elif s in ("<--", "<-o"):
-                    if p_matrix is not None and alpha_level is not None:
-                        if p_matrix[i, j, tau] >= alpha_level:
-                            continue
-                    G[j, i, tau] = 1
-                elif s in symmetric:
-                    if p_matrix is not None and alpha_level is not None:
-                        if p_matrix[i, j, tau] >= alpha_level:
-                            continue
-                    G[i, j, tau] = 1
-                    G[j, i, tau] = 1
+    if p_matrix is not None and alpha_level is not None:
+        keep = ~(np.asarray(p_matrix) >= alpha_level)
+        forward &= keep
+        reverse &= keep
+        sym &= keep
+
+    G = np.zeros(marks.shape, dtype=np.int8)
+    G_t = G.transpose(1, 0, 2)  # view: G_t[i, j, tau] is G[j, i, tau]
+    G[forward] = 1
+    G_t[reverse] = 1
+    G[sym] = 1
+    G_t[sym] = 1
 
     return G
 
