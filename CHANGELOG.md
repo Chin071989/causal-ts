@@ -18,8 +18,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 * `run_cdnots(collider_search="full"|"sepset")`: which conditioning sets the lag-0 collider
   vote searches. `run_cdnots_plus(return_prefix=True)` + `finish_cdnots_plus()` reuse one
   skeleton for several `orient_margin` values.
+* `temporal_bootstrap(n_jobs=, backend=)`: run windows in parallel with joblib (loky by
+  default). Window starts are drawn up front, so results match the serial run for the same
+  seed. Use `n_jobs=1` or `backend="threading"` with GPU CI tests.
+* `CITestAdapter` memoises `run_test` results per test array (`clear_cache()`; reset on
+  `set_dataframe`), so repeated PCMCI/PCMCI+ tests skip the GPU call.
 
 ### Changed
+
+* `tigramite_graph_to_binary()` is vectorized (output unchanged).
 
 * `sigkci` / `SigKCIGPU` renamed to `linsig` / `LinSigCIGPU` (old names deprecated). Results
   change: kernel-scaled ridge (`ridge`, replaces `lamda`), no spurious lag-2 self-loops.
